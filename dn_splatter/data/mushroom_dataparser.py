@@ -94,7 +94,7 @@ class MushroomDataParserConfig(DataParserConfig):
     """Whether to load pcd normals for normal initialisation"""
     create_pc_from_colmap: bool = False
     """Whether to create pointclouds from colmap for the mushroom data."""
-    num_init_points: int = 1_000_000
+    num_init_points: int = 1_000
     """Number of points in initial seed pointcloud. Does not apply to Colmap generated points."""
 
     # general configs
@@ -113,6 +113,16 @@ class MushroomDataParserConfig(DataParserConfig):
     depth_unit_scale_factor: float = 1e-3
     """Scales the depth values to meters. Default value is 0.001 for a millimeter to meter conversion."""
 
+    # Semantic segmentation
+    load_semantics: bool = True
+    """Set to true to load semantic maps."""
+    semantics_dir: Optional[Path] = None  # Path to semantic features directory
+
+    # Limit loaded images
+    max_images_per_capture: Optional[int] = 20
+    """If set, load at most this many images from each capture (long and short)."""
+
+    
 
 class MushroomDataParser(DataParser):
     """MUSHROOM DatasetParser."""
@@ -177,6 +187,13 @@ class MushroomDataParser(DataParser):
             inds = np.argsort([int(fname.stem) for fname in short_fnames])
         short_frames = [short_meta["frames"][ind] for ind in inds]
 
+        # Optionally limit number of loaded images per capture
+        if self.config.max_images_per_capture is not None:
+            limit = int(self.config.max_images_per_capture)
+            if limit > 0:
+                long_frames = long_frames[:limit]
+                short_frames = short_frames[:limit]
+
         if self.config.load_depth_confidence_masks:
             long_data_dir = self.config.data / self.config.mode / "long_capture"
             short_data_dir = self.config.data / self.config.mode / "short_capture"
@@ -212,6 +229,7 @@ class MushroomDataParser(DataParser):
             distort_fixed,
             self.config.use_faro_scanner_depths,
             self.config.load_depth_confidence_masks,
+            self.config.load_semantics,
         )
         (
             return_short_filenames,
@@ -235,6 +253,7 @@ class MushroomDataParser(DataParser):
             distort_fixed,
             self.config.use_faro_scanner_depths,
             self.config.load_depth_confidence_masks,
+            self.config.load_semantics,
         )
         long_filenames = return_long_filenames["image"]
         short_filenames = return_short_filenames["image"]
@@ -242,10 +261,18 @@ class MushroomDataParser(DataParser):
         short_depth_filenames = return_short_filenames["depth"]
         long_mask_filenames = return_long_filenames["mask"]
         short_mask_filenames = return_short_filenames["mask"]
+        long_semantics_filenames = return_long_filenames["semantics"]
+        short_semantics_filenames = return_short_filenames["semantics"]
 
         image_filenames = long_filenames + short_filenames
         mask_filenames = long_mask_filenames + short_mask_filenames
         depth_filenames = long_depth_filenames + short_depth_filenames
+
+        if self.config.load_semantics:
+            semantics_filenames = long_semantics_filenames + short_semantics_filenames
+        else:
+            semantics_filenames = []
+
         if self.config.load_depth_confidence_masks:
             confidence_filenames = (
                 return_long_filenames["confidence"]
@@ -730,6 +757,9 @@ class MushroomDataParser(DataParser):
         if self.config.load_depth_confidence_masks:
             metadata.update({"confidence_filenames": confidence_filenames})
 
+        if self.config.load_semantics:
+            metadata.update({"semantics_filenames": semantics_filenames})
+
         self.scale_factor = scale_factor
         self.transform_matrix = transform_matrix
 
@@ -748,6 +778,8 @@ class MushroomDataParser(DataParser):
                 **metadata,
             },
         )
+        # DEBUG
+        CONSOLE.print("[bold yellow]dataparser_outputs:", dataparser_outputs)
         return dataparser_outputs
 
     def _load_points3D_normals(self, points, colors, transform_matrix: torch.Tensor):
@@ -937,6 +969,7 @@ class MushroomDataParser(DataParser):
         distort_fixed,
         use_faro_scanner_depths,
         load_depth_confidence_masks,
+        load_semantics
     ):
         fx = []
         fy = []
@@ -952,6 +985,9 @@ class MushroomDataParser(DataParser):
         poses = []
         if load_depth_confidence_masks:
             confidence_filenames = []
+
+        if load_semantics:
+            semantics_filenames = []
 
         for frame in frames:
             filepath = Path(frame["file_path"])
@@ -1020,6 +1056,14 @@ class MushroomDataParser(DataParser):
                 )
                 confidence_filenames.append(confidence_fname)
 
+            if load_semantics:
+                # semantics_dir may be provided externally, otherwise expect a "SD" folder next to data_dir
+                sem_dir = data_dir / "SD"
+                semantic_file = sem_dir / (fname.stem + ".npy")
+                semantics_filenames.append(semantic_file)
+ 
+        
+
         if load_depth_confidence_masks:
             return_filenames = {
                 "image": image_filenames,
@@ -1033,6 +1077,9 @@ class MushroomDataParser(DataParser):
                 "mask": mask_filenames,
                 "depth": depth_filenames,
             }
+
+        if load_semantics:
+            return_filenames["semantics"] = semantics_filenames
 
         return (
             return_filenames,

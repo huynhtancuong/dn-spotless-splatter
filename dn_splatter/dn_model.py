@@ -7,11 +7,13 @@ import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from torch import Tensor
 from torch.nn import Parameter
+import torch.nn as nn
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
@@ -25,7 +27,7 @@ from dn_splatter.regularization_strategy import AGSMeshRegularization, DNRegular
 from dn_splatter.utils.camera_utils import get_colored_points_from_depth, project_pix
 from dn_splatter.utils.knn import knn_sk
 from dn_splatter.utils.normal_utils import normal_from_depth_image
-
+import imageio
 try:
     from gsplat.rendering import rasterization
 except ImportError:
@@ -183,7 +185,8 @@ class DNSplatterModel(SplatfactoModel):
         self.rgb_metrics = RGBMetrics()
         self.depth_metrics = DepthMetrics()
         self.normal_metrics = NormalMetrics()
-        distances, indices = self.k_nearest_sklearn(means.data, 3)
+        n_neighbors = min(3, means.data.shape[0]-1)
+        distances, indices = self.k_nearest_sklearn(means.data, n_neighbors)
         distances = torch.from_numpy(distances)
         # find the average of the three nearest neighbors for each point and use that as the scale
         avg_dist = distances.mean(dim=-1, keepdim=True)
@@ -621,9 +624,105 @@ class DNSplatterModel(SplatfactoModel):
             batch: ground truth batch corresponding to outputs
             metrics_dict: dictionary of metrics, some of which we can use for loss
         """
+
+        # DEBUG:
+        # print("-"*80)
+        # print("[DEBUG]: ", type(batch))
+        # print("[DEBUG]: ", batch.keys())
+        # print("[DEBUG]: ", batch["semantics"])
+        # print("-"*80)
+
+        # Implement spotless splatting 
+
+        debug = False
+
+        pixels = self.get_gt_img(batch["image"])
+        renders = outputs["rgb"]
+        
+
+        if renders.shape[-1] == 4:
+                colors, depths = renders[..., 0:3], renders[..., 3:4]
+        else:
+            colors, depths = renders, None
+        
+        colors = torch.clamp(colors, 0., 1.0)
+
+        if colors.dim() == 3:
+            colors = colors.unsqueeze(0)
+        if pixels.dim() == 3:
+            pixels = pixels.unsqueeze(0)
+
+        if debug:
+            print("[DEBUG]: color shape: ", colors.shape)
+            print("[DEBUG]: pixels shape: ", pixels.shape)
+
+        use_robust = True
+        use_cluster = False
+
+        if use_robust:
+            avr_error = 0.1
+            error_per_pixel = torch.abs(colors - pixels)
+            pred_mask = self.robust_mask(
+                error_per_pixel, avr_error
+            )
+            if use_cluster and "semantics" in batch:
+                sf = batch["semantics"].unsqueeze(0)
+                # Print semantic feature shape
+                if debug:
+                    print("[DEBUG]: semantic feature shape before upsampling: ", sf.shape)
+
+                # cluster the semantic feature and mask based on cluster voting
+                sf = nn.Upsample(
+                    size=(colors.shape[1], colors.shape[2]),
+                    mode="nearest",
+                )(sf).squeeze(0).to(pred_mask.device)
+                
+                # Print semantic feature shape
+                if debug:
+                    print("[DEBUG]: semantic feature shape: ", sf.shape)
+                pred_mask = self.robust_cluster_mask(pred_mask, semantics=sf)
+                
+                # Print mask shape
+                if debug:
+                    print("[DEBUG]: mask shape: ", pred_mask.shape)
+
+            if pred_mask.dim() != 3:
+                pred_mask = pred_mask.squeeze(0)
+
+            batch.update({"mask": pred_mask})  # Update the batch with the new mask
+
+            # Visualize the predicted mask: write to png 
+            if debug:
+                try:
+                    rgb_pred_mask = (pred_mask > 0.5).float().repeat(1, 1, 1, 3)
+                    # compose a side-by-side canvas: input | mask | render
+                    canvas = torch.cat([pixels, rgb_pred_mask, colors], dim=2).squeeze(0).cpu().detach().numpy()
+                    # Also save PNG to disk
+                    canvas_uint8 = (canvas * 255).astype(np.uint8)
+                    # create a random number
+                    step = random.randint(0, 10000)
+                    imageio.imwrite(f"train_result/3pred_mask_step{step}.png", canvas_uint8)
+                except Exception as e:
+                    print("[ERROR]: Failed to write predicted mask to PNG:", e)
+                    pass
+
+
+        # End spotless splatting
+
         loss_dict = super().get_loss_dict(
             outputs=outputs, batch=batch, metrics_dict=metrics_dict
         )
+
+        # Clean up
+        # if batch_with_mask is not None:
+        #     del batch_with_mask
+        # if "sf" in locals() and sf is not None:
+        #     del sf
+        # if "pred_mask" in locals() and pred_mask is not None:
+        #     del pred_mask
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         main_loss = loss_dict["main_loss"]
         scale_reg = loss_dict["scale_reg"]
 
@@ -645,6 +744,8 @@ class DNSplatterModel(SplatfactoModel):
         if "confidence" in batch:
             confidence = 1 - self.get_gt_img(batch["confidence"]) / 255.0
 
+
+        # TODO: Maybe we can use a mask from spotless here? 
         if "mask" in batch:
             # batch["mask"] : [H, W, 1]
             assert batch["mask"].shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
@@ -661,6 +762,13 @@ class DNSplatterModel(SplatfactoModel):
 
         # RGB loss
         rgb_loss = main_loss
+        if use_robust:
+            rgb_loss = (pred_mask.clone().detach() * error_per_pixel).mean()
+            ssimloss = 1.0 - self.ssim(
+                pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2)
+            )
+            ssim_lambda = 0.5
+            loss = rgb_loss * (1.0 - ssim_lambda) + ssimloss * ssim_lambda
 
         pred_normal = outputs["normal"]
         surface_normal = outputs["surface_normal"]
@@ -725,8 +833,55 @@ class DNSplatterModel(SplatfactoModel):
             )
 
         main_loss = rgb_loss + regularization_strategy_loss
+        if use_robust:
+            main_loss = loss + regularization_strategy_loss
 
         return {"main_loss": main_loss, "scale_reg": scale_reg}
+    
+
+    def robust_mask(
+        self, error_per_pixel: torch.Tensor, loss_threshold: float
+    ) -> torch.Tensor:
+        epsilon = 1e-3
+        error_per_pixel = error_per_pixel.mean(dim=-1, keepdim=True)
+        error_per_pixel = error_per_pixel.squeeze(-1).unsqueeze(0)
+        is_inlier_pixel = (error_per_pixel < loss_threshold).float()
+        window_size = 3
+        channel = 1
+        window = torch.ones((1, 1, window_size, window_size), dtype=torch.float) / (
+            window_size * window_size
+        )
+        if error_per_pixel.is_cuda:
+            window = window.cuda(error_per_pixel.get_device())
+        window = window.type_as(error_per_pixel)
+        has_inlier_neighbors = F.conv2d(
+            is_inlier_pixel, window, padding=window_size // 2, groups=channel
+        )
+        has_inlier_neighbors = (has_inlier_neighbors > 0.5).float()
+        is_inlier_pixel = ((has_inlier_neighbors + is_inlier_pixel) > epsilon).float()
+        pred_mask = is_inlier_pixel.squeeze(0).unsqueeze(-1)
+        return pred_mask
+
+    def robust_cluster_mask(self, inlier_sf, semantics):
+
+        # print("[DEBUG]: inlier_sf device: ", inlier_sf.device)
+        # print("[DEBUG]: semantics device: ", semantics.device)
+
+        inlier_sf = inlier_sf.squeeze(-1).unsqueeze(0)
+        cluster_size = torch.sum(
+            semantics, dim=(-1, -2), keepdim=True, dtype=torch.float
+        )
+        # inlier_sf = inlier_sf.to(semantics.device)  # Ensure semantics is on the same device as inlier_sf
+        inlier_cluster_size = torch.sum(
+            inlier_sf * semantics, dim=(-1, -2), keepdim=True, dtype=torch.float
+        )
+        cluster_inlier_percentage = (inlier_cluster_size / cluster_size).float()
+        is_inlier_cluster = (cluster_inlier_percentage > 0.5).float()
+        inlier_sf = torch.sum(
+            semantics * is_inlier_cluster, dim=1, keepdim=True, dtype=torch.float
+        )
+        pred_mask = inlier_sf.squeeze(0).unsqueeze(-1)
+        return pred_mask
 
     def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
         """Compute and returns metrics.

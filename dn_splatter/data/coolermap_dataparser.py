@@ -79,6 +79,10 @@ class CoolerMapDataParserConfig(ColmapDataParserConfig):
     """Whether to automatically scale the poses to fit in +/- 1 bounding box."""
     downscale_factor: int = 1
 
+    # Semantic segmentation
+    load_semantics: bool = True
+    """Set to true to load semantic maps."""
+
 
 class CoolerMapDataParser(ColmapDataParser):
     config: CoolerMapDataParserConfig
@@ -105,6 +109,9 @@ class CoolerMapDataParser(ColmapDataParser):
 
     def get_normal_filepaths(self):
         return natsorted(glob.glob(f"{self.normal_save_dir}/*.png"))
+
+    def get_semantic_filepaths(self):
+        return natsorted(glob.glob(f"{self.semantics_dir}/*.npy"))
 
     def _generate_dataparser_outputs(self, split: str = "train", **kwargs):
         assert (
@@ -299,6 +306,15 @@ class CoolerMapDataParser(ColmapDataParser):
                 {"normal_filenames": [Path(normal_filenames[idx]) for idx in indices]}
             )
             metadata.update({"normal_format": self.config.normal_format})
+
+        # Load semantic maps
+        self.semantics_dir = self.config.data / "SD"
+        if self.config.load_semantics:
+            semantics_filenames = self.get_semantic_filepaths()
+            metadata.update(
+                {"semantics_filenames": [Path(semantics_filenames[idx]) for idx in indices]}
+            )
+
 
         metadata.update({"load_normals": self.config.load_normals})
         if self.config.load_pcd_normals:

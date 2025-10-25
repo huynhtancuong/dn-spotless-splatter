@@ -67,6 +67,8 @@ class DNSplatterDataManager(FullImageDatamanager):
             else False
         )
 
+        self.load_semantics = True if ("semantic_filenames" in metadata) else False
+
         self.load_normals = True if ("normal_filenames" in metadata) else False
         self.load_confidence = True if ("confidence_filenames" in metadata) else False
         self.image_idx = 0
@@ -101,6 +103,16 @@ class DNSplatterDataManager(FullImageDatamanager):
             data["mask"] = data["mask"].to(self.device)
             if data["mask"].dim() == 2:
                 data["mask"] = data["mask"][..., None]
+
+        if self.load_semantics:
+            if "semantics" in data:
+                data["semantics"] = data["semantics"].to(self.device)
+                if data["semantics"].shape != data["image"].shape:
+                    data["semantics"] = TF.resize(
+                        data["semantics"].permute(2, 0, 1),
+                        data["image"].shape[:2],
+                        antialias=None,
+                    ).permute(1, 2, 0)
 
         if self.load_depths:
             if "sensor_depth" in data:

@@ -12,7 +12,7 @@ from PIL import Image
 
 from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 from nerfstudio.data.datasets.base_dataset import InputDataset
-from nerfstudio.data.utils.data_utils import get_depth_image_from_path
+from nerfstudio.data.utils.data_utils import get_depth_image_from_path, get_semantics_and_mask_tensors_from_path
 from nerfstudio.utils.rich_utils import CONSOLE
 
 
@@ -32,6 +32,11 @@ class GDataset(InputDataset):
         super().__init__(dataparser_outputs, scale_factor)
 
         # Configs
+        if "load_semantics" in self.metadata:
+            self.load_semantics = self.metadata["load_semantics"]
+        else:
+            self.load_semantics = True
+
         if "load_depths" in self.metadata:
             self.load_depths = self.metadata["load_depths"]
         else:
@@ -77,6 +82,12 @@ class GDataset(InputDataset):
         else:
             self.is_euclidean_depth = False
 
+        # load semantics
+        if self.load_semantics:
+            if "semantics_filenames" in self.metadata:
+                self.semantics_filenames = self.metadata["semantics_filenames"]
+                CONSOLE.print("[bold green] Loaded semantics_filenames!")
+
         # load depths
         if self.load_depths:
             self.depth_unit_scale_factor = self.metadata["depth_unit_scale_factor"]
@@ -121,6 +132,7 @@ class GDataset(InputDataset):
         depth_data = {}
         normal_data = {}
         confidence_data = {}
+        semantics_data = {}
         if self.load_depths:
             # try to load depth data
             height = int(self._dataparser_outputs.cameras.height[data["image_idx"]])
@@ -188,9 +200,19 @@ class GDataset(InputDataset):
                 scale_factor=1.0,
             )
             confidence_data.update({"confidence": confidence_image})
+
+        if self.load_semantics:
+            assert self.semantics_filenames is not None
+            filepath = self.semantics_filenames[data["image_idx"]]
+            arr = np.load(filepath)
+            # arr = arr.astype("int64")  # ensure integer type
+            semantics = torch.from_numpy(arr).float()
+            semantics_data.update({"semantics": semantics})
+
         metadata.update(depth_data)
         metadata.update(normal_data)
         metadata.update(confidence_data)
+        metadata.update(semantics_data)
         return metadata
 
     def _find_transform(self, image_path: Path) -> Union[Path, None]:
@@ -207,7 +229,7 @@ class GDataset(InputDataset):
         normal_format: Literal["omnidata", "dsine"],
         normal_frame: Literal["camera_frame", "world_frame"],
         c2w: Optional[None] = None,
-    ):
+    ) -> torch.Tensor:
         """Helper function to load normal data
 
         Args:
