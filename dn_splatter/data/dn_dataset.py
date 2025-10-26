@@ -35,7 +35,7 @@ class GDataset(InputDataset):
         if "load_semantics" in self.metadata:
             self.load_semantics = self.metadata["load_semantics"]
         else:
-            self.load_semantics = True
+            self.load_semantics = False
 
         if "load_depths" in self.metadata:
             self.load_depths = self.metadata["load_depths"]

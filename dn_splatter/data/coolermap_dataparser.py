@@ -308,6 +308,7 @@ class CoolerMapDataParser(ColmapDataParser):
             metadata.update({"normal_format": self.config.normal_format})
 
         # Load semantic maps
+        metadata.update({"load_semantics": self.config.load_semantics})
         self.semantics_dir = self.config.data / "SD"
         if self.config.load_semantics:
             semantics_filenames = self.get_semantic_filepaths()

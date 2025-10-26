@@ -1,5 +1,5 @@
 """
-Depth + normal splatter
+Depth + normal + spotless splatter
 """
 
 import math
@@ -124,9 +124,22 @@ class DNSplatterModelConfig(SplatfactoModelConfig):
     pearson_lambda: float = 0
     """Regularizer for pearson depth loss"""
 
+    ### Spotless configs ###
+    use_robust_mask: bool = False
+    """Whether to use robust masking"""
+    use_cluster: bool = False
+    """Whether to use clustering"""
+    robust_mask_avr_error: float = 0.1
+    """Average error for robust masking"""
+    robust_mask_ssim_lambda: float = 0.5
+    """SSIM loss weight for robust masking"""
+    debug_flag: bool = False
+    """Whether to print debug information"""
+    export_mask: bool = False
+    """Whether to export the mask"""
 
 class DNSplatterModel(SplatfactoModel):
-    """Depth + Normal splatter"""
+    """Depth + Normal + Spotless splatter"""
 
     config: DNSplatterModelConfig
 
@@ -625,21 +638,17 @@ class DNSplatterModel(SplatfactoModel):
             metrics_dict: dictionary of metrics, some of which we can use for loss
         """
 
-        # DEBUG:
-        # print("-"*80)
-        # print("[DEBUG]: ", type(batch))
-        # print("[DEBUG]: ", batch.keys())
-        # print("[DEBUG]: ", batch["semantics"])
-        # print("-"*80)
-
         # Implement spotless splatting 
 
-        debug = False
+        # Parameters
+        # self.config.use_robust_mask = True
+        # self.config.use_cluster = False
+        # self.config.robust_mask_avr_error = 0.1
 
+        # Adapter between dn-splatting and spotless 
         pixels = self.get_gt_img(batch["image"])
         renders = outputs["rgb"]
         
-
         if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
         else:
@@ -652,47 +661,36 @@ class DNSplatterModel(SplatfactoModel):
         if pixels.dim() == 3:
             pixels = pixels.unsqueeze(0)
 
-        if debug:
+        if self.config.debug_flag:
             print("[DEBUG]: color shape: ", colors.shape)
             print("[DEBUG]: pixels shape: ", pixels.shape)
 
-        use_robust = True
-        use_cluster = False
-
-        if use_robust:
-            avr_error = 0.1
+        # dynamic masking algorithm from Spotless 
+        if self.config.use_robust_mask:
             error_per_pixel = torch.abs(colors - pixels)
             pred_mask = self.robust_mask(
-                error_per_pixel, avr_error
+                error_per_pixel, self.config.robust_mask_avr_error
             )
-            if use_cluster and "semantics" in batch:
+            pred_mask_robust = pred_mask.clone()
+            if self.config.use_cluster and "semantics" in batch:
                 sf = batch["semantics"].unsqueeze(0)
-                # Print semantic feature shape
-                if debug:
-                    print("[DEBUG]: semantic feature shape before upsampling: ", sf.shape)
-
                 # cluster the semantic feature and mask based on cluster voting
                 sf = nn.Upsample(
                     size=(colors.shape[1], colors.shape[2]),
                     mode="nearest",
                 )(sf).squeeze(0).to(pred_mask.device)
-                
-                # Print semantic feature shape
-                if debug:
-                    print("[DEBUG]: semantic feature shape: ", sf.shape)
+            
                 pred_mask = self.robust_cluster_mask(pred_mask, semantics=sf)
-                
-                # Print mask shape
-                if debug:
-                    print("[DEBUG]: mask shape: ", pred_mask.shape)
 
             if pred_mask.dim() != 3:
                 pred_mask = pred_mask.squeeze(0)
+                pred_mask_robust = pred_mask_robust.squeeze(0)
 
-            batch.update({"mask": pred_mask})  # Update the batch with the new mask
+            # Update the batch with the new mask
+            batch.update({"mask": pred_mask})  
 
             # Visualize the predicted mask: write to png 
-            if debug:
+            if self.config.debug_flag and self.config.export_mask:
                 try:
                     rgb_pred_mask = (pred_mask > 0.5).float().repeat(1, 1, 1, 3)
                     # compose a side-by-side canvas: input | mask | render
@@ -713,13 +711,7 @@ class DNSplatterModel(SplatfactoModel):
             outputs=outputs, batch=batch, metrics_dict=metrics_dict
         )
 
-        # Clean up
-        # if batch_with_mask is not None:
-        #     del batch_with_mask
-        # if "sf" in locals() and sf is not None:
-        #     del sf
-        # if "pred_mask" in locals() and pred_mask is not None:
-        #     del pred_mask
+        # Clean up 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -744,8 +736,10 @@ class DNSplatterModel(SplatfactoModel):
         if "confidence" in batch:
             confidence = 1 - self.get_gt_img(batch["confidence"]) / 255.0
 
+        # Only robust_mask can apply to depth and normal. The segmentation mask is unstable.
+        if self.config.use_robust_mask:
+            batch.update({"mask": pred_mask_robust})
 
-        # TODO: Maybe we can use a mask from spotless here? 
         if "mask" in batch:
             # batch["mask"] : [H, W, 1]
             assert batch["mask"].shape[:2] == gt_img.shape[:2] == pred_img.shape[:2]
@@ -760,15 +754,16 @@ class DNSplatterModel(SplatfactoModel):
             if "normal" in outputs:
                 outputs["normal"] = outputs["normal"] * mask
 
-        # RGB loss
-        rgb_loss = main_loss
-        if use_robust:
+        # RGB loss with dynamic masking
+        if self.config.use_robust_mask: 
             rgb_loss = (pred_mask.clone().detach() * error_per_pixel).mean()
             ssimloss = 1.0 - self.ssim(
                 pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2)
             )
-            ssim_lambda = 0.5
-            loss = rgb_loss * (1.0 - ssim_lambda) + ssimloss * ssim_lambda
+            ssim_lambda = self.config.robust_mask_ssim_lambda
+            rgb_loss = rgb_loss * (1.0 - ssim_lambda) + ssimloss * ssim_lambda
+        else:
+            rgb_loss = main_loss
 
         pred_normal = outputs["normal"]
         surface_normal = outputs["surface_normal"]
@@ -832,9 +827,8 @@ class DNSplatterModel(SplatfactoModel):
                 **additional_data,
             )
 
+
         main_loss = rgb_loss + regularization_strategy_loss
-        if use_robust:
-            main_loss = loss + regularization_strategy_loss
 
         return {"main_loss": main_loss, "scale_reg": scale_reg}
     
